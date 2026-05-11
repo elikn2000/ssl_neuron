@@ -3,6 +3,7 @@
 
 import copy
 import torch
+import numpy as np
 import torch.nn as nn
 from typing import Any
 
@@ -225,6 +226,7 @@ class GraphDINO(nn.Module):
         teacher_temp: float = 0.06,
         moving_average_decay: float = 0.999,
         center_moving_average_decay: float = 0.9,
+        loss_function: str = 'hyperbolic'
     ):
         super().__init__()
 
@@ -245,6 +247,22 @@ class GraphDINO(nn.Module):
 
         self.student_temp = student_temp
         self.teacher_temp = teacher_temp
+        self.loss_function = loss_function.lower()
+
+        valid_loss_functions = {'euclidean', 'hyperbolic', 'cross_entropy'}
+        if self.loss_function not in valid_loss_functions:
+            raise ValueError(
+                f"Unsupported loss_function '{loss_function}'. "
+                f"Valid options are: {sorted(valid_loss_functions)}"
+            )
+        self.loss_fn = self.hyperbolic_loss
+        if self.loss_function == 'euclidean':
+            self.loss_fn = self.euclidean_loss
+        elif self.loss_function == 'hyperbolic':
+            self.loss_fn = self.hyperbolic_loss
+        elif self.loss_function == 'cross_entropy':
+            self.loss_fn = self.compute_loss
+            
 
     def compute_loss(self, teacher_logits, student_logits, eps = 1e-20):
         teacher_logits = teacher_logits.detach()
@@ -252,7 +270,20 @@ class GraphDINO(nn.Module):
         teacher_probs = ((teacher_logits - self.teacher_centers) / self.teacher_temp).softmax(dim = -1)
         loss = - (teacher_probs * torch.log(student_probs + eps)).sum(dim = -1).mean()
         return loss
-
+    def euclidean_loss(self, teacher_logits, student_logits, eps = 1e-20):
+        teacher_logits=teacher_logits.detach()
+        loss = (teacher_logits - student_logits).pow(2).sum(dim = -1).mean()
+        return loss
+    def hyperbolic_loss(self, teacher_logits, student_logits, K = -1, eps = 1e-20):
+        teacher_logits=teacher_logits.detach()
+        loss=1/np.sqrt(abs(K))*torch.acosh(torch.clamp(K*((teacher_logits * student_logits).sum(dim=-1)-torch.sqrt(torch.norm(teacher_logits, dim=-1)**2-1/K)*torch.sqrt(torch.norm(student_logits, dim=-1)**2-1/K)),min=1+eps)).mean()
+        return loss
+    def hyperbolic_cross_entropy_loss(self, teacher_logits, student_logits, K = -1, eps = 1e-15):
+        teacher_logits=teacher_logits.detach()
+        student_probs = (student_logits / self.student_temp).softmax(dim = -1)
+        teacher_probs = ((teacher_logits - self.teacher_centers) / self.teacher_temp).softmax(dim = -1)
+        loss=1/np.sqrt(abs(K))*torch.acosh(torch.clamp(K*((teacher_probs * student_probs).sum(dim=-1)-torch.sqrt(torch.norm(teacher_probs, dim=-1)**2-1/K)*torch.sqrt(torch.norm(student_probs, dim=-1)**2-1/K)),min=1+eps)).mean()
+        return loss
     def update_moving_average(self, decay=None):
         update_moving_average(self.teacher_ema_updater, self.teacher_encoder, self.student_encoder, decay=decay)
 
@@ -277,8 +308,10 @@ class GraphDINO(nn.Module):
         teacher_logits_avg = teacher_proj.mean(dim = 0)
         self.previous_centers.copy_(teacher_logits_avg)
 
-        loss1 = self.compute_loss(teacher_proj1, student_proj2)
-        loss2 = self.compute_loss(teacher_proj2, student_proj1)
+      
+
+        loss1 = self.loss_fn(teacher_proj1, student_proj2)
+        loss2 = self.loss_fn(teacher_proj2, student_proj1)
         loss = (loss1 + loss2) / 2
 
         return loss
@@ -297,11 +330,13 @@ def create_model(config):
                  num_classes=num_classes)
 
     # Create GraphDINO.
-    model = GraphDINO(transformer,
-                 num_classes=num_classes, 
-                 moving_average_decay=config['model']['move_avg'],
-                 center_moving_average_decay=config['model']['center_avg'],
-                 teacher_temp=config['model']['teacher_temp']
-                )
+    model = GraphDINO(
+        transformer,
+        num_classes=num_classes,
+        moving_average_decay=config['model']['move_avg'],
+        center_moving_average_decay=config['model']['center_avg'],
+        teacher_temp=config['model']['teacher_temp'],
+        loss_function=config['model']['loss_function']
+    )
     
     return model

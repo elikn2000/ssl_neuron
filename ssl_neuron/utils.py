@@ -385,3 +385,9 @@ def plot_tsne(z, labels, targets, colors=None):
                     color=colors[label])
     plt.legend(bbox_to_anchor=(1,1))
     plt.axis('off')
+
+
+def PV_to_Poincare(embedding,K):
+    norm_sq = torch.norm(embedding, dim=-1)**2
+    beta=1/torch.sqrt(1-K*norm_sq)
+    return (np.sqrt(abs(K)) * beta / (1 + beta)).unsqueeze(-1) * embedding

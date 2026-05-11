@@ -1,5 +1,6 @@
 import os
 import torch
+import wandb
 import torch.optim as optim
 from ssl_neuron.utils import AverageMeter, compute_eig_lapl_torch_batch
 
@@ -24,7 +25,7 @@ class Trainer(object):
         
         self.optimizer = optim.Adam(list(self.model.parameters()), lr=0)
         
-        
+      
     def set_lr(self): 
         if self.curr_iter < len(self.lr_warmup):
             lr = self.lr_warmup[self.curr_iter]
@@ -77,8 +78,8 @@ class Trainer(object):
             losses.update(loss.detach(), n)
             self.curr_iter += 1
 
-        print('Epoch {} | Loss {:.4f}'.format(epoch, losses.avg))
-
+        #print('Epoch {} | Loss {:.4f}'.format(epoch, losses.avg))
+        wandb.log({'loss_train': losses.avg})
 
     def _save_checkpoint(self, epoch):
         filename = 'ckpt_{}.pt'.format(epoch)

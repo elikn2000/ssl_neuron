@@ -1,5 +1,6 @@
 {
     "model": {
+        "name": "PV_SPACE_EMBEDDING",
         "num_classes": 1000,
         "dim": 32,
         "depth": 7,
@@ -7,11 +8,12 @@
         "pos_dim": 32,
         "move_avg": 0.999,
         "center_avg": 0.9,
-        "teacher_temp": 0.06
+        "teacher_temp": 0.06,
+        "loss_function": "hyperbolic"
     },
     "data": {
         "class": "allen",
-        "path": "data/",
+        "path": "/user/elias.knack/u27510/ssl_neuron/ssl_neuron/data_2/",
         "n_nodes": 200,
         "feat_dim": 3,
         "batch_size": 64,
@@ -29,6 +31,11 @@
     "trainer": {
         "ckpt_dir": "ssl_neuron/ckpts/",
         "save_ckpt_every": 50,
+        "plot_latents_every": 10,
         "seed": null
+    },
+    "testing": {
+        "ckpt_dir": "ssl_neuron/ckpts/",
+        "epoch": 100
     }
 }

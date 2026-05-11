@@ -16,7 +16,7 @@ class GraphDataset(Dataset):
     position is (0, 0, 0) and axons have been removed. Node positions
     are assumed to be in microns and y-axis is orthogonal to the pia.
     """
-    def __init__(self, config, mode='train', inference=False):
+    def __init__(self, config, mode='train', inference=False, max_samples=None):
 
         self.config = config
         self.mode = mode
@@ -32,7 +32,8 @@ class GraphDataset(Dataset):
 
         # Load cell ids.
         cell_ids = list(np.load(Path(data_path, f'{mode}_ids.npy')))
-
+        if max_samples is not None:
+            cell_ids = cell_ids[:max_samples]
         # Load graphs.
         self.manager = Manager()
         self.cells = self.manager.dict()
