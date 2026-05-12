@@ -275,8 +275,28 @@ class GraphDINO(nn.Module):
         loss = (teacher_logits - student_logits).pow(2).sum(dim = -1).mean()
         return loss
     def hyperbolic_loss(self, teacher_logits, student_logits, K = -1, eps = 1e-20):
-        teacher_logits=teacher_logits.detach()
-        loss=1/np.sqrt(abs(K))*torch.acosh(torch.clamp(K*((teacher_logits * student_logits).sum(dim=-1)-torch.sqrt(torch.norm(teacher_logits, dim=-1)**2-1/K)*torch.sqrt(torch.norm(student_logits, dim=-1)**2-1/K)),min=1+eps)).mean()
+        # 1. Detach and avoid inplace issues
+        teacher_logits = teacher_logits.detach()
+
+        # 2. Secure the norms
+        # Ensure the value inside sqrt is strictly positive
+        t_norm_sq = torch.norm(teacher_logits, dim=-1)**2
+        s_norm_sq = torch.norm(student_logits, dim=-1)**2
+
+        t_sqrt = torch.sqrt(torch.clamp(t_norm_sq - 1/K, min=1e-7))
+        s_sqrt = torch.sqrt(torch.clamp(s_norm_sq - 1/K, min=1e-7))
+
+        # 3. Calculate the dot product
+        dot_prod = (teacher_logits * student_logits).sum(dim=-1)
+
+        # 4. Clamp the acosh input 
+        # Using a slightly larger min (1 + 1e-5) prevents the 1/sqrt(0) gradient problem
+        acosh_input = torch.clamp(K * (dot_prod - t_sqrt * s_sqrt), min=1 + 1e-5)
+
+        # 5. Final Loss
+        loss = (1 / np.sqrt(abs(K))) * torch.acosh(acosh_input).mean()
+        # teacher_logits=teacher_logits.detach()
+        # loss=1/np.sqrt(abs(K))*torch.acosh(torch.clamp(K*((teacher_logits * student_logits).sum(dim=-1)-torch.sqrt(torch.norm(teacher_logits, dim=-1)**2-1/K)*torch.sqrt(torch.norm(student_logits, dim=-1)**2-1/K)),min=1+eps)).mean()
         return loss
     def hyperbolic_cross_entropy_loss(self, teacher_logits, student_logits, K = -1, eps = 1e-15):
         teacher_logits=teacher_logits.detach()
@@ -307,14 +327,14 @@ class GraphDINO(nn.Module):
 
         teacher_logits_avg = teacher_proj.mean(dim = 0)
         self.previous_centers.copy_(teacher_logits_avg)
-
-      
+        max_val=torch.norm(teacher_proj1, dim=-1).max()
+        teacher_logits_avg_avg =teacher_logits_avg.mean(dim=0)
 
         loss1 = self.loss_fn(teacher_proj1, student_proj2)
         loss2 = self.loss_fn(teacher_proj2, student_proj1)
         loss = (loss1 + loss2) / 2
 
-        return loss
+        return loss, max_val, teacher_logits_avg_avg
 
 
 def create_model(config):

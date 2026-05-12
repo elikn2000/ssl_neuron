@@ -20,7 +20,7 @@ def main(args):
     # build model 
     model = create_model(config)
     wandb.login()
-    wandb.init(project='SSL_Neuron_Hyperbolic_embedding', entity="ecker-lab", config=config)
+    wandb.init(project='SSL_Neuron_Hyperbolic_embedding', entity="ecker-lab", config=config, name=config['model']['name'])
     trainer = Trainer(config, model, [train_loader, val_loader])
 
     print('Start training.')
