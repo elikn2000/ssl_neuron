@@ -6,6 +6,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 from typing import Any
+from ssl_neuron.graph_ops import PVFC, PVManifoldMLR, _pv_dist
 
 
 class GraphAttention(nn.Module):
@@ -121,7 +122,9 @@ class GraphTransformer(nn.Module):
                  num_classes: int = 1000,
                  pos_dim: int = 32,
                  proj_dim: int = 128,
-                 use_exp: bool = True) -> nn.Module:
+                 use_exp: bool = True,
+                 hyperbolic_MLP_proj: bool = False,
+                loss_function: str = 'cross_entropy') -> nn.Module:
         super().__init__()
 
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
@@ -133,21 +136,44 @@ class GraphTransformer(nn.Module):
 
         self.to_pos_embedding = nn.Linear(pos_dim, dim)
 
-        self.mlp_head = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim)
-        )
+        if hyperbolic_MLP_proj is True:
 
-        self.projector = nn.Sequential(
-            nn.Linear(dim, proj_dim),
-            nn.GELU(),
-            nn.Linear(proj_dim, proj_dim),
-            nn.GELU(),
-            nn.Linear(proj_dim, proj_dim),
-            nn.GELU(),
-            nn.LayerNorm(proj_dim),
-            nn.Linear(proj_dim, num_classes)
-        )
+            self.mlp_head = nn.Sequential(
+                nn.LayerNorm(dim),
+                PVFC(in_features=dim, out_features=dim, k=-1, use_bias=True)
+                )
+            if loss_function == 'cross_entropy':
+                self.projector = nn.Sequential(
+                    PVFC(in_features=dim,  out_features=proj_dim, k=-1, use_bias=True, inner_act='gelu'),
+                    PVFC(in_features=proj_dim,  out_features=proj_dim, k=-1, use_bias=True, inner_act='gelu'),
+                    PVFC(in_features=proj_dim,  out_features=proj_dim,k=-1, use_bias=True, inner_act='gelu'),
+                    nn.LayerNorm(proj_dim),
+                    PVManifoldMLR(in_features=proj_dim,  num_classes=num_classes, k=-1)
+                    )
+            if loss_function == 'hyperbolic':
+                self.projector = nn.Sequential(
+                    PVFC(in_features=dim,  out_features=proj_dim, k=-1, use_bias=True, inner_act='gelu'),
+                    PVFC(in_features=proj_dim,  out_features=proj_dim, k=-1, use_bias=True, inner_act='gelu'),
+                    PVFC(in_features=proj_dim,  out_features=proj_dim,k=-1, use_bias=True, inner_act='gelu'),
+                    nn.LayerNorm(proj_dim),
+                    PVFC(in_features=proj_dim,  out_features=num_classes, k=-1, use_bias=True, inner_act='gelu')
+                    )
+        else: 
+            self.mlp_head = nn.Sequential(
+                nn.LayerNorm(dim),
+                nn.Linear(dim, dim)
+            )
+
+            self.projector = nn.Sequential(
+                nn.Linear(dim, proj_dim),
+                nn.GELU(),
+                nn.Linear(proj_dim, proj_dim),
+                nn.GELU(),
+                nn.Linear(proj_dim, proj_dim),
+                nn.GELU(),
+                nn.LayerNorm(proj_dim),
+                nn.Linear(proj_dim, num_classes)
+            )
 
         self.to_node_embedding = nn.Sequential(
             nn.Linear(feat_dim, dim * 2),
@@ -226,7 +252,7 @@ class GraphDINO(nn.Module):
         teacher_temp: float = 0.06,
         moving_average_decay: float = 0.999,
         center_moving_average_decay: float = 0.9,
-        loss_function: str = 'hyperbolic'
+        loss_function: str = 'cross_entropy'
     ):
         super().__init__()
 
@@ -261,48 +287,42 @@ class GraphDINO(nn.Module):
         elif self.loss_function == 'hyperbolic':
             self.loss_fn = self.hyperbolic_loss
         elif self.loss_function == 'cross_entropy':
-            self.loss_fn = self.compute_loss
+            self.loss_fn = self.cross_entropy
             
 
-    def compute_loss(self, teacher_logits, student_logits, eps = 1e-20):
+    def cross_entropy(self, teacher_logits, student_logits, eps = 1e-20):
         teacher_logits = teacher_logits.detach()
         student_probs = (student_logits / self.student_temp).softmax(dim = -1)
         teacher_probs = ((teacher_logits - self.teacher_centers) / self.teacher_temp).softmax(dim = -1)
         loss = - (teacher_probs * torch.log(student_probs + eps)).sum(dim = -1).mean()
         return loss
-    def euclidean_loss(self, teacher_logits, student_logits, eps = 1e-20):
+    def euclidean_loss(self, teacher_logits, student_logits):
         teacher_logits=teacher_logits.detach()
         loss = (teacher_logits - student_logits).pow(2).sum(dim = -1).mean()
         return loss
-    def hyperbolic_loss(self, teacher_logits, student_logits, K = -1, eps = 1e-20):
+    def hyperbolic_loss(self, teacher_logits, student_logits, K = -1):
         # 1. Detach and avoid inplace issues
         teacher_logits = teacher_logits.detach()
+        loss=_pv_dist(teacher_logits, student_logits, k=K, neg_k=-K, s=1.0 / np.sqrt(-K), tiny=1e-15).mean()
+        # # 2. Secure the norms
+        # # Ensure the value inside sqrt is strictly positive
+        # t_norm_sq = torch.norm(teacher_logits, dim=-1)**2
+        # s_norm_sq = torch.norm(student_logits, dim=-1)**2
 
-        # 2. Secure the norms
-        # Ensure the value inside sqrt is strictly positive
-        t_norm_sq = torch.norm(teacher_logits, dim=-1)**2
-        s_norm_sq = torch.norm(student_logits, dim=-1)**2
+        # t_sqrt = torch.sqrt(torch.clamp(t_norm_sq - 1/K, min=1e-7))
+        # s_sqrt = torch.sqrt(torch.clamp(s_norm_sq - 1/K, min=1e-7))
 
-        t_sqrt = torch.sqrt(torch.clamp(t_norm_sq - 1/K, min=1e-7))
-        s_sqrt = torch.sqrt(torch.clamp(s_norm_sq - 1/K, min=1e-7))
+        # # 3. Calculate the dot product
+        # dot_prod = (teacher_logits * student_logits).sum(dim=-1)
 
-        # 3. Calculate the dot product
-        dot_prod = (teacher_logits * student_logits).sum(dim=-1)
+        # # 4. Clamp the acosh input 
+        # # Using a slightly larger min (1 + 1e-5) prevents the 1/sqrt(0) gradient problem
+        # acosh_input = torch.clamp(K * (dot_prod - t_sqrt * s_sqrt), min=1 + 1e-5)
 
-        # 4. Clamp the acosh input 
-        # Using a slightly larger min (1 + 1e-5) prevents the 1/sqrt(0) gradient problem
-        acosh_input = torch.clamp(K * (dot_prod - t_sqrt * s_sqrt), min=1 + 1e-5)
-
-        # 5. Final Loss
-        loss = (1 / np.sqrt(abs(K))) * torch.acosh(acosh_input).mean()
-        # teacher_logits=teacher_logits.detach()
-        # loss=1/np.sqrt(abs(K))*torch.acosh(torch.clamp(K*((teacher_logits * student_logits).sum(dim=-1)-torch.sqrt(torch.norm(teacher_logits, dim=-1)**2-1/K)*torch.sqrt(torch.norm(student_logits, dim=-1)**2-1/K)),min=1+eps)).mean()
-        return loss
-    def hyperbolic_cross_entropy_loss(self, teacher_logits, student_logits, K = -1, eps = 1e-15):
-        teacher_logits=teacher_logits.detach()
-        student_probs = (student_logits / self.student_temp).softmax(dim = -1)
-        teacher_probs = ((teacher_logits - self.teacher_centers) / self.teacher_temp).softmax(dim = -1)
-        loss=1/np.sqrt(abs(K))*torch.acosh(torch.clamp(K*((teacher_probs * student_probs).sum(dim=-1)-torch.sqrt(torch.norm(teacher_probs, dim=-1)**2-1/K)*torch.sqrt(torch.norm(student_probs, dim=-1)**2-1/K)),min=1+eps)).mean()
+        # # 5. Final Loss
+        # loss = (1 / np.sqrt(abs(K))) * torch.acosh(acosh_input).mean()
+        # # teacher_logits=teacher_logits.detach()
+        # # loss=1/np.sqrt(abs(K))*torch.acosh(torch.clamp(K*((teacher_logits * student_logits).sum(dim=-1)-torch.sqrt(torch.norm(teacher_logits, dim=-1)**2-1/K)*torch.sqrt(torch.norm(student_logits, dim=-1)**2-1/K)),min=1+eps)).mean()
         return loss
     def update_moving_average(self, decay=None):
         update_moving_average(self.teacher_ema_updater, self.teacher_encoder, self.student_encoder, decay=decay)
@@ -347,7 +367,10 @@ def create_model(config):
                  num_heads=config['model']['n_head'],
                  feat_dim=config['data']['feat_dim'],
                  pos_dim=config['model']['pos_dim'],
-                 num_classes=num_classes)
+                 num_classes=num_classes,
+                 hyperbolic_MLP_proj=config['model']['hyperbolic_MLP_proj'],
+                 loss_function=config['model']['loss_function']
+                 )
 
     # Create GraphDINO.
     model = GraphDINO(

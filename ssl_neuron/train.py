@@ -87,31 +87,7 @@ class Trainer(object):
         wandb.log({'loss_train': losses.avg})
         wandb.log({'teacher_logits_avg': torch.norm(teacher_logits.avg, dim=-1)})
         wandb.log({'max_val': max_val})
-    def plot_latents(self):
-        self.model.eval()
-        dset= self.val_loader.dataset   
 
-        latents = np.zeros((dset.num_samples, config['model']['dim']))
-
-        learning_rate = 5.0
-        learning_rate_for_h_loss = 0.1
-        perplexity = 20
-        early_exaggeration = 1.0
-        student_t_gamma = 0.1
-
-        for i in tqdm(range(dset.num_samples)):
-            feat, neigh = dset.__getsingleitem__(i)
-            adj = neighbors_to_adjacency_torch(neigh, list(neigh.keys())).float().to(device)[None, ]
-            lapl = compute_eig_lapl_torch_batch(adj, pos_enc_dim=config['model']['pos_dim']).float().to(device)
-            feat = torch.from_numpy(feat).float().to(device)[None, ]
-    
-            latents[i] = model.student_encoder.forward(feat, adj, lapl)[0].cpu().detach()
-
-        Poincare_Latents=PV_to_Poincare(latents,-1)
-
-        tsne_embeddings, HT_SNE_embeddings, CO_SNE_embedding  = run_TSNE(Poincare_Latents, learning_rate, learning_rate_for_h_loss, perplexity, early_exaggeration, student_t_gamma)
-        plot_low_dims(tsne_embeddings, HT_SNE_embeddings, CO_SNE_embedding, colors, learning_rate, learning_rate_for_h_loss, perplexity, early_exaggeration, student_t_gamma) 
-        
     def _save_checkpoint(self, epoch):
         filename = '{}_{}.pt'.format(self.model_name, epoch)
         PATH = os.path.join(self.ckpt_dir, filename)

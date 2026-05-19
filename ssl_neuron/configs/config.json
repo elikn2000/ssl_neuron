@@ -1,6 +1,6 @@
 {
     "model": {
-        "name": "PV_SPACE_EMBEDDING",
+        "name": "Euclidean_Euclidean_Distance_Loss",
         "num_classes": 1000,
         "dim": 32,
         "depth": 7,
@@ -9,11 +9,12 @@
         "move_avg": 0.999,
         "center_avg": 0.9,
         "teacher_temp": 0.06,
-        "loss_function": "hyperbolic"
+        "hyperbolic_MLP_proj": false,
+        "loss_function": "euclidean"
     },
     "data": {
         "class": "allen",
-        "path": "/user/elias.knack/u27510/ssl_neuron/ssl_neuron/data_2/",
+        "path": "/user/elias.knack/u27510/ssl_neuron/ssl_neuron/data/",
         "n_nodes": 200,
         "feat_dim": 3,
         "batch_size": 64,
@@ -36,6 +37,8 @@
     },
     "testing": {
         "ckpt_dir": "ssl_neuron/ckpts/",
+        "Classifier": "MLR", 
+        "embedding": "vector_embedding",
         "epoch": 100
     }
 }

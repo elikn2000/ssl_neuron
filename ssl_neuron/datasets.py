@@ -5,7 +5,6 @@ from tqdm import tqdm
 from pathlib import Path
 from torch.multiprocessing import Manager
 from torch.utils.data import Dataset, DataLoader
-
 from ssl_neuron.utils import subsample_graph, rotate_graph, jitter_node_pos, translate_soma_pos, get_leaf_branch_nodes, compute_node_distances, drop_random_branch, remap_neighbors, neighbors_to_adjacency_torch
 
 
@@ -37,6 +36,7 @@ class GraphDataset(Dataset):
         # Load graphs.
         self.manager = Manager()
         self.cells = self.manager.dict()
+        self.cell_ids = []
         count = 0
         for cell_id in tqdm(cell_ids):
             # Adapt for datasets where this is not true.
@@ -74,7 +74,7 @@ class GraphDataset(Dataset):
                     'soma_id': soma_id,
                     'leaf_branch_nodes': leaf_branch_nodes,
                 }
-
+                self.cell_ids.append(cell_id)
                 self.cells[count] = item
                 count += 1
 
@@ -164,18 +164,18 @@ class GraphDataset(Dataset):
         return features1, features2, adj_matrix1, adj_matrix2
     
 
-def build_dataloader(config, use_cuda=torch.cuda.is_available()):
+def build_dataloader(config, use_cuda=torch.cuda.is_available(), max_train_samples=None, max_val_samples=None):
 
     kwargs = {'num_workers':config['data']['num_workers'], 'pin_memory':True, 'persistent_workers': True} if use_cuda else {}
 
     train_loader = DataLoader(
-            GraphDataset(config, mode='train'),
+            GraphDataset(config, mode='train', max_samples=max_train_samples),
             batch_size=config['data']['batch_size'], 
             shuffle=True, 
             drop_last=True,
             **kwargs)
 
-    val_dataset = GraphDataset(config, mode='val')
+    val_dataset = GraphDataset(config, mode='val', max_samples=max_val_samples)
     batch_size = val_dataset.num_samples if val_dataset.__len__() < config['data']['batch_size'] else config['data']['batch_size']
     val_loader = DataLoader(
             val_dataset,
@@ -185,3 +185,4 @@ def build_dataloader(config, use_cuda=torch.cuda.is_available()):
             **kwargs)
 
     return train_loader, val_loader
+
