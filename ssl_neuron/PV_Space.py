@@ -8,7 +8,9 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import numpy as np
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 TINY = 1e-15
 EPS = {torch.float32: 1e-6, torch.float64: 1e-12}
 def _eps(x: torch.Tensor) -> float: return EPS.get(x.dtype, 1e-12)
@@ -153,6 +155,12 @@ def _sinhc(z: torch.Tensor) -> torch.Tensor:
 def _sech(x: torch.Tensor) -> torch.Tensor:
     return 1.0 / torch.cosh(x)
 
+# ---------- Conversion to Poincare Ball ----------
+
+def PV_to_Poincare(embedding,K):
+    norm_sq = torch.norm(embedding, dim=-1)**2
+    beta=1/torch.sqrt(1-K*norm_sq)
+    return (np.sqrt(abs(K)) * beta / (1 + beta)).unsqueeze(-1) * embedding
 # =====================================================================
 #                           Proper-Velocity Space
 # =====================================================================
@@ -335,42 +343,116 @@ class PVManifoldMLR(nn.Module):
         
         return scale * torch.asinh(argument)
 
+class PV_MLR_Classifier(nn.Module):
 
-def predict_pvmlr(
-    model: PVManifoldMLR,
-    X: torch.Tensor,
-    classes: T.Optional[T.Union[torch.Tensor, T.List[int], T.Tuple[int, ...]]] = None,
-) -> torch.Tensor:
-    """Predict class labels using a PVManifoldMLR model.
+    def __init__(self, k: float, in_features: int, classes):
+        super().__init__()
+        if isinstance(classes, torch.Tensor):
+            self.classes = classes.cpu().numpy()
+        else:
+            self.classes = np.array(classes)
 
-    This mirrors sklearn.linear_model.LogisticRegression.predict:
-    - computes scores via the PVManifoldMLR forward pass
-    - returns the class with maximum score per sample
+        self.model=PVManifoldMLR(k, in_features, len(classes))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        logits = self.model(x)
 
-    Args:
-        model: trained PVManifoldMLR model
-        X: input tensor of shape [n_samples, n_features]
-        classes: optional array-like of class labels corresponding to model outputs
-
-    Returns:
-        Tensor of predicted class indices or class labels.
-    """
-    if not isinstance(X, torch.Tensor):
-        X = torch.as_tensor(X, dtype=torch.float32)
-
-    device = next(model.parameters()).device if any(model.parameters()) else X.device
-    X = X.to(device)
-    model.eval()
-    with torch.no_grad():
-        logits = model(X)
+        return logits
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        logits = self.forward(x)
         preds = torch.argmax(logits, dim=1)
+        return torch.tensor(self.classes)[preds.cpu()]
+    
+    def train_PV_MLR_Classifier(self, X, y, epochs=100, lr=0.01, batch_size=64, device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")):
+        """
+        Trains the PVManifoldMLR using precalculated embeddings.
+        Accepts string labels by factorizing them and returns a wrapper with a
+        sklearn-like `predict` that returns labels in the original form.
 
-    if classes is not None:
-        if not isinstance(classes, torch.Tensor):
-            classes = torch.as_tensor(classes, device=device)
-        return classes[preds].cpu()
+        Args:
+            X: np.array or torch.Tensor of shape [N, embedding_dim]
+            y: np.array or torch.Tensor of shape [N] (integer or string labels)
+            num_classes: Total unique cell types (if None, inferred from y)
+            k: Curvature (must be negative)
+        """
+        # 1. Prepare Data
+        if not isinstance(X, torch.Tensor):
+            X = torch.tensor(X, dtype=torch.float32)
 
-    return preds.cpu()
+        # Work on a numpy view of y to detect string/object dtypes
+        if isinstance(y, torch.Tensor):
+            y_arr = y.cpu().numpy()
+        else:
+            y_arr = np.array(y)
+
+        # Detect string/object labels and factorize
+        sorter=np.argsort(self.classes)
+        y_indices = sorter[np.searchsorted(self.classes, y_arr, sorter=sorter)]
+        identity=np.eye(len(self.classes))
+        y_vec=identity[y_indices]
+        y_tensor = torch.tensor(y_vec, dtype=torch.float32)
+        dataset = TensorDataset(X, y_tensor)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        # 2. Initialize Layer
+        self.model.to(device)
+        
+        optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
+
+        # 3. Training Loop
+        self.model.train()
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            correct = 0
+            total = 0
+            
+            for batch_x, batch_y in loader:
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+                
+                optimizer.zero_grad()
+                logits = self.model(batch_x)
+                loss = criterion(logits, batch_y)
+                
+                loss.backward()
+                # Gradient clipping is highly recommended for hyperbolic layers
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                optimizer.step()
+                
+            #     epoch_loss += loss.item()
+            #     _, predicted = logits.max(1)
+            #     total += batch_y.size(0)
+            #     correct += predicted.eq(batch_y).sum().item()
+
+            # if (epoch + 1) % 10 == 0 or epoch == 0:
+            #     acc = 100. * correct / total
+            #     print(f"Epoch {epoch+1:3d}: Loss = {epoch_loss/len(loader):.4f}, Acc = {acc:.2f}%")
+    def predict(self,X: torch.Tensor):
+        """Predict class labels using a PVManifoldMLR model.
+
+        This mirrors sklearn.linear_model.LogisticRegression.predict:
+        - computes scores via the PVManifoldMLR forward pass
+        - returns the class with maximum score per sample
+
+        Args:
+            model: trained PVManifoldMLR model
+            X: input tensor of shape [n_samples, n_features]
+            classes: optional array-like of class labels corresponding to model outputs
+
+        Returns:
+            Tensor of predicted class indices or class labels.
+        """
+        if not isinstance(X, torch.Tensor):
+            X = torch.as_tensor(X, dtype=torch.float32)
+
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        X = X.to(device)
+        self.model.eval()
+        with torch.no_grad():
+            logits = self.model(X)
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+        return self.classes[preds]
+
+        
 
 
 # =====================================================================

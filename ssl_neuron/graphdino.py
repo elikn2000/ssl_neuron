@@ -6,7 +6,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 from typing import Any
-from ssl_neuron.graph_ops import PVFC, PVManifoldMLR, _pv_dist
+from ssl_neuron.PV_Space import PVFC, PVManifoldMLR, _pv_dist
 
 
 class GraphAttention(nn.Module):
@@ -123,7 +123,8 @@ class GraphTransformer(nn.Module):
                  pos_dim: int = 32,
                  proj_dim: int = 128,
                  use_exp: bool = True,
-                 hyperbolic_MLP_proj: bool = False,
+                 hyperbolic_MLP: bool = False,
+                 hyperbolic_Projection: bool = False,
                 loss_function: str = 'cross_entropy') -> nn.Module:
         super().__init__()
 
@@ -136,12 +137,18 @@ class GraphTransformer(nn.Module):
 
         self.to_pos_embedding = nn.Linear(pos_dim, dim)
 
-        if hyperbolic_MLP_proj is True:
+        if hyperbolic_MLP is True:
 
             self.mlp_head = nn.Sequential(
                 nn.LayerNorm(dim),
                 PVFC(in_features=dim, out_features=dim, k=-1, use_bias=True)
                 )
+        else:
+            self.mlp_head = nn.Sequential(
+                nn.LayerNorm(dim),
+                nn.Linear(dim, dim)
+            )
+        if hyperbolic_Projection is True:
             if loss_function == 'cross_entropy':
                 self.projector = nn.Sequential(
                     PVFC(in_features=dim,  out_features=proj_dim, k=-1, use_bias=True, inner_act='gelu'),
@@ -159,11 +166,6 @@ class GraphTransformer(nn.Module):
                     PVFC(in_features=proj_dim,  out_features=num_classes, k=-1, use_bias=True, inner_act='gelu')
                     )
         else: 
-            self.mlp_head = nn.Sequential(
-                nn.LayerNorm(dim),
-                nn.Linear(dim, dim)
-            )
-
             self.projector = nn.Sequential(
                 nn.Linear(dim, proj_dim),
                 nn.GELU(),
@@ -252,10 +254,10 @@ class GraphDINO(nn.Module):
         teacher_temp: float = 0.06,
         moving_average_decay: float = 0.999,
         center_moving_average_decay: float = 0.9,
-        loss_function: str = 'cross_entropy'
+        loss_function: str = 'cross_entropy',   
     ):
         super().__init__()
-
+        
         self.student_encoder = transformer
         self.teacher_encoder = copy.deepcopy(self.student_encoder)
 
@@ -342,19 +344,20 @@ class GraphDINO(nn.Module):
         student_proj1, student_proj2 = torch.split(student_proj, batch_size, dim=0)
 
         with torch.no_grad():
-            _, teacher_proj = self.teacher_encoder(node_feat, adj, lapl)
+            teacher_logits, teacher_proj = self.teacher_encoder(node_feat, adj, lapl)
             teacher_proj1, teacher_proj2 = torch.split(teacher_proj, batch_size, dim=0)
 
         teacher_logits_avg = teacher_proj.mean(dim = 0)
+        teacher_logits_avgnorm=torch.norm(teacher_logits, dim=-1).mean(dim=0)
         self.previous_centers.copy_(teacher_logits_avg)
-        max_val=torch.norm(teacher_proj1, dim=-1).max()
-        teacher_logits_avg_avg =teacher_logits_avg.mean(dim=0)
+        max_val=torch.norm(teacher_logits, dim=-1).max()
+        
 
         loss1 = self.loss_fn(teacher_proj1, student_proj2)
         loss2 = self.loss_fn(teacher_proj2, student_proj1)
         loss = (loss1 + loss2) / 2
 
-        return loss, max_val, teacher_logits_avg_avg
+        return loss, max_val, teacher_logits_avgnorm
 
 
 def create_model(config):
@@ -368,7 +371,8 @@ def create_model(config):
                  feat_dim=config['data']['feat_dim'],
                  pos_dim=config['model']['pos_dim'],
                  num_classes=num_classes,
-                 hyperbolic_MLP_proj=config['model']['hyperbolic_MLP_proj'],
+                 hyperbolic_MLP=config['model']['hyperbolic_MLP'],
+                 hyperbolic_Projection=config['model']['hyperbolic_Projection'],
                  loss_function=config['model']['loss_function']
                  )
 
