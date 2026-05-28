@@ -6,7 +6,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 from typing import Any
-from ssl_neuron.PV_Space import PVFC, PVManifoldMLR, _pv_dist
+from ssl_neuron.PV_Space import PVFC, PVManifoldMLR, _pv_dist, LearnableCurvature, FixedCurvature
 
 
 class GraphAttention(nn.Module):
@@ -125,11 +125,18 @@ class GraphTransformer(nn.Module):
                  use_exp: bool = True,
                  hyperbolic_MLP: bool = False,
                  hyperbolic_Projection: bool = False,
-                loss_function: str = 'cross_entropy') -> nn.Module:
+                 curvature: Any = 'learnable',
+                 loss_function: str = 'cross_entropy') -> nn.Module:
         super().__init__()
 
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.cls_pos_embedding = nn.Parameter(torch.randn(1, 1, dim))
+
+        # Initialize curvature
+        if curvature == 'learnable':
+            self.curvature = LearnableCurvature(init_k=1.0)
+        else:
+            self.curvature = FixedCurvature(k=curvature)
 
         self.blocks = nn.Sequential(*[
             AttentionBlock(dim=dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_exp=use_exp)
@@ -141,7 +148,7 @@ class GraphTransformer(nn.Module):
 
             self.mlp_head = nn.Sequential(
                 nn.LayerNorm(dim),
-                PVFC(in_features=dim, out_features=dim, k=-1, use_bias=True)
+                PVFC(in_features=dim, out_features=dim, curvature=self.curvature, use_bias=True)
                 )
         else:
             self.mlp_head = nn.Sequential(
@@ -151,19 +158,19 @@ class GraphTransformer(nn.Module):
         if hyperbolic_Projection is True:
             if loss_function == 'cross_entropy':
                 self.projector = nn.Sequential(
-                    PVFC(in_features=dim,  out_features=proj_dim, k=-1, use_bias=True, inner_act='gelu'),
-                    PVFC(in_features=proj_dim,  out_features=proj_dim, k=-1, use_bias=True, inner_act='gelu'),
-                    PVFC(in_features=proj_dim,  out_features=proj_dim,k=-1, use_bias=True, inner_act='gelu'),
+                    PVFC(in_features=dim,  out_features=proj_dim, curvature=self.curvature, use_bias=True, inner_act='gelu'),
+                    PVFC(in_features=proj_dim,  out_features=proj_dim,curvature=self.curvature, use_bias=True, inner_act='gelu'),
+                    PVFC(in_features=proj_dim,  out_features=proj_dim,curvature=self.curvature, use_bias=True, inner_act='gelu'),
                     nn.LayerNorm(proj_dim),
-                    PVManifoldMLR(in_features=proj_dim,  num_classes=num_classes, k=-1)
+                    PVManifoldMLR(in_features=proj_dim,  num_classes=num_classes, curvature=self.curvature)
                     )
             if loss_function == 'hyperbolic':
                 self.projector = nn.Sequential(
-                    PVFC(in_features=dim,  out_features=proj_dim, k=-1, use_bias=True, inner_act='gelu'),
-                    PVFC(in_features=proj_dim,  out_features=proj_dim, k=-1, use_bias=True, inner_act='gelu'),
-                    PVFC(in_features=proj_dim,  out_features=proj_dim,k=-1, use_bias=True, inner_act='gelu'),
+                    PVFC(in_features=dim,  out_features=proj_dim, curvature=self.curvature, use_bias=True, inner_act='gelu'),
+                    PVFC(in_features=proj_dim,  out_features=proj_dim, curvature=self.curvature, use_bias=True, inner_act='gelu'),
+                    PVFC(in_features=proj_dim,  out_features=proj_dim,curvature=self.curvature, use_bias=True, inner_act='gelu'),
                     nn.LayerNorm(proj_dim),
-                    PVFC(in_features=proj_dim,  out_features=num_classes, k=-1, use_bias=True, inner_act='gelu')
+                    PVFC(in_features=proj_dim,  out_features=num_classes, curvature=self.curvature, use_bias=True, inner_act='gelu')
                     )
         else: 
             self.projector = nn.Sequential(
@@ -257,10 +264,8 @@ class GraphDINO(nn.Module):
         loss_function: str = 'cross_entropy',   
     ):
         super().__init__()
-        
         self.student_encoder = transformer
         self.teacher_encoder = copy.deepcopy(self.student_encoder)
-
         # Weights of teacher model are updated using an exponential moving
         # average of the student model. Thus, disable gradient update.
         for p in self.teacher_encoder.parameters():
@@ -356,7 +361,7 @@ class GraphDINO(nn.Module):
         loss1 = self.loss_fn(teacher_proj1, student_proj2)
         loss2 = self.loss_fn(teacher_proj2, student_proj1)
         loss = (loss1 + loss2) / 2
-
+        
         return loss, max_val, teacher_logits_avgnorm
 
 
@@ -373,7 +378,8 @@ def create_model(config):
                  num_classes=num_classes,
                  hyperbolic_MLP=config['model']['hyperbolic_MLP'],
                  hyperbolic_Projection=config['model']['hyperbolic_Projection'],
-                 loss_function=config['model']['loss_function']
+                 loss_function=config['model']['loss_function'],
+                 curvature=config['model']['curvature']
                  )
 
     # Create GraphDINO.
