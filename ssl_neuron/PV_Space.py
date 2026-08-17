@@ -27,7 +27,7 @@ def _pv_beta(x: torch.Tensor, k: float, tiny: float) -> torch.Tensor:
 
 
 @_script
-def _pv_gyro_add(x: torch.Tensor, y: torch.Tensor, k: float, neg_k: float, tiny: float) -> torch.Tensor:
+def _pv_gyro_add(x: torch.Tensor, y: torch.Tensor, k: float, neg_k: float, tiny: float = TINY) -> torch.Tensor:
     b_x = _pv_beta(x, k, tiny)
     b_y = _pv_beta(y, k, tiny)
     xy = (x * y).sum(dim=-1, keepdim=True)
@@ -36,7 +36,7 @@ def _pv_gyro_add(x: torch.Tensor, y: torch.Tensor, k: float, neg_k: float, tiny:
     term2 = (1.0 / b_y) - 1.0
     coef = term1 + term2
     return x + y + coef * x
-
+#s=1/sqrt(-k)
 
 @_script
 def _pv_gyro_scalar_mul(
@@ -82,7 +82,7 @@ def _pv_gyro_neg(x: torch.Tensor) -> torch.Tensor:
 
 
 @_script
-def _pv_dist(x: torch.Tensor, y: torch.Tensor, k: float, neg_k: float, s: float, tiny: float) -> torch.Tensor:
+def _pv_dist(x: torch.Tensor, y: torch.Tensor, k: float, neg_k: float, s: float, tiny: float=TINY) -> torch.Tensor:
     z = _pv_gyro_add(_pv_gyro_neg(x), y, k, neg_k, tiny)
     b_z = _pv_beta(z, k, tiny)
     p = (b_z / (1.0 + b_z)) * z
@@ -134,7 +134,22 @@ def _pv_proj(x: torch.Tensor, max_norm: float, eps: float) -> torch.Tensor:
     norm = torch.norm(x, p=2, dim=-1, keepdim=True).clamp_min(eps)
     scale = torch.clamp(max_norm / norm, max=1.0)
     return scale * x
-
+@_script
+def _pv_Lorentz_prod(x: torch.Tensor, y: torch.Tensor, k: float, tiny: float) -> torch.Tensor:
+    """
+    Computes the Lorentzian inner product in PV space.
+    <x, y>_L =  x_0 * y_0 - sum_{i=1}^{d} x_i * y_i
+    where x_0 = sqrt( ||x||^2-1/k ) and y_0 = sqrt( ||y||^2-1/k )
+    """
+    x_sq = (x * x).sum(dim=-1, keepdim=True)
+    y_sq = (y * y).sum(dim=-1, keepdim=True)
+    x0 = torch.sqrt(x_sq-1/k).clamp_min(tiny)
+    y0 = torch.sqrt( y_sq-1/k).clamp_min(tiny)
+    return x0 * y0 - (x * y).sum(dim=-1, keepdim=True)
+def _pv_Lorentz_norm(x: torch.Tensor, k: float, tiny: float):
+    return torch.sqrt(torch.clamp(torch.abs(_pv_Lorentz_prod(x, x, k, tiny)), min=tiny))
+def _pv_Residual(x: torch.Tensor, y: torch.Tensor, alpha: float, k: float, neg_k: float, s: float, tiny: float) -> torch.Tensor:
+    return _pv_exp_map(x, _pv_log_map(x, y, k, neg_k, s, tiny) * alpha, k, neg_k, np.sqrt(neg_k), tiny)
 # ---------- Core Factors ----------
 def beta(x: torch.Tensor, k: float) -> torch.Tensor:
     """
@@ -161,6 +176,20 @@ def PV_to_Poincare(embedding,K):
     norm_sq = torch.norm(embedding, dim=-1)**2
     beta=1/torch.sqrt(1-K*norm_sq)
     return (np.sqrt(abs(K)) * beta / (1 + beta)).unsqueeze(-1) * embedding
+class PV_layer_norm(nn.Module):
+
+    def __init__(self, k: float, dimension: int):
+        super().__init__()
+        self.k = float(k)
+        self.neg_k = -self.k                    # -K (positive value, equivalent to c)
+        self.s = 1.0 / math.sqrt(self.neg_k) 
+        self.eucnorm = nn.LayerNorm(dimension)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    
+        return _pv_expmap0(self.eucnorm(_pv_logmap0(x,  self.s, eps= TINY) ),  self.s, eps= TINY)
+  
+    
 # =====================================================================
 #                           Proper-Velocity Space
 # =====================================================================
@@ -254,7 +283,12 @@ class PVManifold:
         if max_norm is None:
             return x
         return _pv_proj(x, float(max_norm), _eps(x))
-
+    def Lorentz_prod(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return _pv_Lorentz_prod(x, y, self.k, TINY)
+    def Lorentz_norm(self, x: torch.Tensor):
+        return _pv_Lorentz_norm(x, self.k, TINY)
+    def Residual(self, x: torch.Tensor, y: torch.Tensor, alpha: float) -> torch.Tensor:
+        return _pv_Residual(x, y, alpha, self.k, self.neg_k, self.s, TINY)
 
 # =====================================================================
 #                  PV Multinomial Logistic Regression
@@ -268,13 +302,13 @@ class PVManifoldMLR(nn.Module):
         z_k: Direction in tangent space at origin
         r_k: Scalar bias (distance along geodesic)
     """
-    def __init__(self, k: float, in_features: int, num_classes: int):
+    def __init__(self, k, in_features: int, num_classes: int):
         super().__init__()
-        assert k < 0, "Curvature K must be negative."
-        self.k = float(k)
+        self.k = k
         self.neg_k = -self.k
+        self.s = 1.0 / math.sqrt(self.neg_k)
         self.sqrt_neg_k = math.sqrt(self.neg_k)
-        
+
         self.d = in_features
         self.K_classes = num_classes
 
@@ -298,6 +332,7 @@ class PVManifoldMLR(nn.Module):
         Argument inside asinh:
            sqrt(-K)/||z|| * [ cosh(sqrt(-K)r) <x,z> - sinh(sqrt(-K)r) * sqrt(1-K||x||^2) * ||z||/sqrt(-K) ]
         """
+
         # Precompute ||z_k||
         z_norm = self.z.norm(dim=-1, keepdim=True).clamp_min(TINY) # [K, 1]
         
@@ -343,26 +378,107 @@ class PVManifoldMLR(nn.Module):
         
         return scale * torch.asinh(argument)
 
-class PV_MLR_Classifier(nn.Module):
 
-    def __init__(self, k: float, in_features: int, classes):
+
+
+
+# =====================================================================
+#                           PV Fully Connected
+# =====================================================================
+class PVFC(nn.Module):
+    """
+    PV Fully Connected Layer using K < 0.
+    Maps PV -> PV via hyperplane distances.
+    
+    y_k = (1/sqrt(-K)) * sinh( sqrt(-K) * act(v_k(x)) )
+    """
+    def __init__(self, k, in_features: int, out_features: int, 
+                 use_bias: bool = True, act: str = 'none'):
+        super().__init__()
+        self.k=k
+        self.neg_k = -self.k                    # -K (positive value, equivalent to c)
+        self.s = 1.0 / math.sqrt(self.neg_k)    # s = 1/sqrt(-K)
+        self.sqrt_neg_k = math.sqrt(self.neg_k) # sqrt(-K)
+        # 1. Linear-like transformation (calculates v_k)
+        self.mlr = PVManifoldMLR(k=self.k, in_features=in_features, num_classes=out_features)
+
+        # 2. Bias setup
+        self.use_bias = use_bias
+        self.bias = nn.Parameter(torch.zeros(out_features)) if use_bias else None
+       
+        
+        # 3. Inner activation (applied to the distance v_k)
+        self.act = act.lower() if isinstance(act, str) else 'none'
+
+    def _activate_v(self, v: torch.Tensor) -> torch.Tensor:
+        """Apply non-linearity to the signed distances."""
+        if self.act== 'gelu':
+            return F.gelu(v)
+        if self.act == 'relu':
+            return F.relu(v)
+        if self.act == 'tanh':
+            return torch.tanh(v)
+        if self.act == 'softplus':
+            return F.softplus(v, beta=1, threshold=20.)
+        return v
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. Get signed distances v_k(x) [B, out]
+        
+        s = 1/self.sqrt_neg_k
+        v = self.mlr(x) 
+        
+        # 2. Apply optional inner activation on distances
+        v = self._activate_v(v)
+        
+        # 3. Apply non-linearity to map distance back to coordinate
+        # y = (1/sqrt(-K)) * sinh( sqrt(-K) * v )
+        arg = self.sqrt_neg_k * v
+        arg = torch.clamp(arg, -15.0, 15.0) # Numerical stability clip
+        y = (1.0 / self.sqrt_neg_k) * torch.sinh(arg)
+        
+        # 4. Apply Bias (via Gyro-addition in PV space)
+        if self.use_bias and self.bias is not None:
+            # Bias is a vector in tangent space at origin
+            # Map it to manifold: Exp_0(bias)
+            b_hyp = _pv_expmap0(self.bias.unsqueeze(0), self.s, _eps(v))
+            # Add bias: y (+) b
+            y = _pv_gyro_add(y, b_hyp, self.k, self.neg_k, TINY)
+            
+        return y
+
+class PV_MLP_Classifier(nn.Module):
+
+    def __init__(self, k, num_hidden, dim_hidden, classes, in_features: int):
         super().__init__()
         if isinstance(classes, torch.Tensor):
             self.classes = classes.cpu().numpy()
         else:
             self.classes = np.array(classes)
-
-        self.model=PVManifoldMLR(k, in_features, len(classes))
+        if num_hidden is None or num_hidden == 0:
+            self.model=PVManifoldMLR(k=k, in_features=in_features, num_classes=len(classes))
+        else:
+            hidden_layers=[PVFC(k=k, in_features=in_features, out_features=dim_hidden, use_bias=True, act='gelu')]
+            for i in range(num_hidden-1):
+                hidden_layers.append(PVFC(k=k, in_features=dim_hidden, out_features=dim_hidden, use_bias=True, act='gelu'))
+            self.model=nn.Sequential(*hidden_layers, PVManifoldMLR(k=k, in_features=dim_hidden, num_classes=len(classes)))
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         logits = self.model(x)
 
         return logits
-    def predict(self, x: torch.Tensor) -> torch.Tensor:
-        logits = self.forward(x)
-        preds = torch.argmax(logits, dim=1)
-        return torch.tensor(self.classes)[preds.cpu()]
+    def predict(self, x):
+        if not isinstance(x, torch.Tensor):
+            x = torch.tensor(x, dtype=torch.float32)
+            logits = self.forward(x)
+            preds = torch.argmax(logits, dim=1)
+            return (torch.tensor(self.classes)[preds.cpu()]).numpy()
+        else:
+            logits = self.forward(x)
+            preds = torch.argmax(logits, dim=1)
+            return torch.tensor(self.classes)[preds.cpu()]
+
     
-    def train_PV_MLR_Classifier(self, X, y, epochs=100, lr=0.01, batch_size=64, device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")):
+    def train_PV_MLP_Classifier(self, X, y, epochs=100, lr=0.01, batch_size=64, device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")):
         """
         Trains the PVManifoldMLR using precalculated embeddings.
         Accepts string labels by factorizing them and returns a wrapper with a
@@ -452,69 +568,77 @@ class PV_MLR_Classifier(nn.Module):
             preds = torch.argmax(logits, dim=1).cpu().numpy()
         return self.classes[preds]
 
-        
 
-
-# =====================================================================
-#                           PV Fully Connected
-# =====================================================================
-class PVFC(nn.Module):
+class PVFC_2(nn.Module):
     """
     PV Fully Connected Layer using K < 0.
     Maps PV -> PV via hyperplane distances.
     
     y_k = (1/sqrt(-K)) * sinh( sqrt(-K) * act(v_k(x)) )
     """
-    def __init__(self, k: float, in_features: int, out_features: int, 
-                 use_bias: bool = True, inner_act: str = 'none'):
+    def __init__(self, k, in_features: int, out_features: int, 
+                 use_bias: bool = True, act: str = 'none'):
         super().__init__()
-        assert k < 0, "Curvature K must be negative."
-        self.k = float(k)
-        self.neg_k = -self.k
-        self.sqrt_neg_k = math.sqrt(self.neg_k)
-        
+        self.k=k
+        self.neg_k = -self.k                    # -K (positive value, equivalent to c)
+        self.s = 1.0 / math.sqrt(self.neg_k)    # s = 1/sqrt(-K)
+        self.sqrt_neg_k = math.sqrt(self.neg_k) # sqrt(-K)
         # 1. Linear-like transformation (calculates v_k)
-        self.mlr = PVManifoldMLR(k, in_features, out_features)
-        
         # 2. Bias setup
         self.use_bias = use_bias
         self.bias = nn.Parameter(torch.zeros(out_features)) if use_bias else None
-        self.manifold = PVManifold(k)
-        
-        # 3. Inner activation (applied to the distance v_k)
-        self.inner_act = inner_act.lower() if isinstance(inner_act, str) else 'none'
+        self.weight=nn.Linear(in_features=in_features, out_features=out_features, bias=False)
 
-    def _activate_v(self, v: torch.Tensor) -> torch.Tensor:
+        # 3. Inner activation (applied to the distance v_k)
+        self.act = act.lower() if isinstance(act, str) else 'none'
+
+    def _activate(self, v: torch.Tensor) -> torch.Tensor:
         """Apply non-linearity to the signed distances."""
-        if self.inner_act== 'gelu':
-            return F.gelu(v)
-        if self.inner_act == 'relu':
-            return F.relu(v)
-        if self.inner_act == 'tanh':
-            return torch.tanh(v)
-        if self.inner_act == 'softplus':
-            return F.softplus(v, beta=1, threshold=20.)
+        if self.act== 'gelu':
+            return _pv_expmap0(F.gelu(_pv_logmap0(v,self.s, _eps(v))),self.s, _eps(v))
+        if self.act == 'relu':
+            return  _pv_expmap0(F.relu(_pv_logmap0(v,self.s, _eps(v))),self.s, _eps(v))
+        if self.act == 'tanh':
+            return  _pv_expmap0(torch.tanh(_pv_logmap0(v,self.s, _eps(v))),self.s, _eps(v))
+        if self.act == 'softplus':
+            return  _pv_expmap0(F.softplus(_pv_logmap0(v,self.s, _eps(v)), beta=1, threshold=20.),self.s, _eps(v))
         return v
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1. Get signed distances v_k(x) [B, out]
-        v = self.mlr(x) 
+        x=_pv_logmap0(x,self.s, _eps(x))
+        x=_pv_expmap0(self.weight(x),self.s, _eps(x))
+        if self.use_bias:
+            x=_pv_gyro_add(self.bias.unsqueeze(0), x, self.k, self.neg_k, TINY)
+        x=self._activate(x)
         
-        # 2. Apply optional inner activation on distances
-        v = self._activate_v(v)
-        
-        # 3. Apply non-linearity to map distance back to coordinate
-        # y = (1/sqrt(-K)) * sinh( sqrt(-K) * v )
-        arg = self.sqrt_neg_k * v
-        arg = torch.clamp(arg, -15.0, 15.0) # Numerical stability clip
-        y = (1.0 / self.sqrt_neg_k) * torch.sinh(arg)
-        
-        # 4. Apply Bias (via Gyro-addition in PV space)
-        if self.use_bias and self.bias is not None:
-            # Bias is a vector in tangent space at origin
-            # Map it to manifold: Exp_0(bias)
-            b_hyp = self.manifold.exp0(self.bias.unsqueeze(0))
-            # Add bias: y (+) b
-            y = self.manifold.gyro_add(y, b_hyp)
             
-        return y
+        return x
+
+class PVMLR_2(nn.Module):
+    """
+    PV Fully Connected Layer using K < 0.
+    Maps PV -> PV via hyperplane distances.
+    
+    y_k = (1/sqrt(-K)) * sinh( sqrt(-K) * act(v_k(x)) )
+    """
+    def __init__(self, k, in_features: int, num_classes: int):
+        super().__init__()
+        self.k=k
+        self.neg_k = -self.k                    # -K (positive value, equivalent to c)
+        self.s = 1.0 / math.sqrt(self.neg_k)    # s = 1/sqrt(-K)
+        self.sqrt_neg_k = math.sqrt(self.neg_k) # sqrt(-K)
+        # 1. Linear-like transformation (calculates v_k)
+        # 2. Bias setup
+        self.bias = nn.Parameter(torch.zeros(num_classes))
+        self.weight=nn.Linear(in_features=in_features, out_features=num_classes, bias=False)
+
+        # 3. Inner activation (applied to the distance v_k)
+       
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x=_pv_logmap0(x,self.s, _eps(x))
+        x=_pv_expmap0(self.weight(x),self.s, _eps(x))
+        x=_pv_gyro_add(self.bias.unsqueeze(0), x, self.k, self.neg_k, TINY)
+        
+            
+        return x

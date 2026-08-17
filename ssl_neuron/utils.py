@@ -4,7 +4,8 @@ import seaborn as sns
 import matplotlib.pylab as plt
 from collections import defaultdict
 from scipy.spatial.transform import Rotation as R
-
+from ssl_neuron.PV_Space import PVManifold
+import math
     
 class AverageMeter(object):
     """ Computes and stores the average and current value."""
@@ -386,8 +387,26 @@ def plot_tsne(z, labels, targets, colors=None):
     plt.legend(bbox_to_anchor=(1,1))
     plt.axis('off')
 
-
-def PV_to_Poincare(embedding,K):
-    norm_sq = torch.norm(embedding, dim=-1)**2
-    beta=1/torch.sqrt(1-K*norm_sq)
-    return (np.sqrt(abs(K)) * beta / (1 + beta)).unsqueeze(-1) * embedding
+def calculate_distance_data(classified_points, K=-1):
+    PV=PVManifold(k=K)
+    mean_dists_internal=np.zeros(len(classified_points))
+    variance_dists_internal=np.zeros(len(classified_points))
+    for i, klass in enumerate(classified_points):
+        for j in range(len(klass)-1):
+            for k in range(j+1,len(klass)):
+                mean_dists_internal[i]+=PV.dist(torch.from_numpy(klass[j]),torch.from_numpy(klass[k])).numpy()
+        mean_dists_internal[i]/=math.comb(len(klass),2)
+        for j in range(len(klass)-1):
+            for k in range(j+1,len(klass)):
+                variance_dists_internal[i]+=(PV.dist(torch.from_numpy(klass[j]),torch.from_numpy(klass[k])).numpy()-mean_dists_internal[i])**2
+        variance_dists_internal[i]/=math.comb(len(klass),2)
+    mean_dist_other_classes=np.zeros(shape=(len(classified_points), len(classified_points)))
+    for i in range(len(classified_points)-1):
+        for j in range(i+1,len(classified_points)):
+            for a in classified_points[i]:
+                for b in classified_points[j]:
+                    mean_dist_other_classes[i,j]+=PV.dist(torch.from_numpy(a),torch.from_numpy(b)).numpy()
+            mean_dist_other_classes[i,j]/=(len(classified_points[i])*len(classified_points[j]))
+            mean_dist_other_classes[j,i]=mean_dist_other_classes[i,j]
+    mean_distances=mean_dist_other_classes+np.diag(mean_dists_internal)
+    return mean_distances, variance_dists_internal  

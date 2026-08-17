@@ -164,8 +164,13 @@ class GraphDataset(Dataset):
         return features1, features2, adj_matrix1, adj_matrix2
     
 
-def build_dataloader(config, use_cuda=torch.cuda.is_available(), max_train_samples=None, max_val_samples=None):
-
+def build_dataloader(config, use_cuda=torch.cuda.is_available(), test=False):
+    if test:
+        max_train_samples=100
+        max_val_samples=10
+    else:
+        max_train_samples=None
+        max_val_samples=None
     kwargs = {'num_workers':config['data']['num_workers'], 'pin_memory':True, 'persistent_workers': True} if use_cuda else {}
 
     train_loader = DataLoader(

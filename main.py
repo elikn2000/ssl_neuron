@@ -11,13 +11,16 @@ parser.add_argument('--config', help='Path to config file.', type=str, default='
 
 def main(args):
     # load config
+    
+
     config = json.load(open(args.config))
     
     # load data
     print('Loading dataset: {}'.format(config['data']['class']))
-    train_loader, val_loader = build_dataloader(config)
+    train_loader, val_loader = build_dataloader(config, test=False)
 
     # build model 
+    
     model = create_model(config)
     wandb.login()
     wandb.init(project='SSL_Neuron_Hyperbolic_embedding', entity="ecker-lab", config=config, name=config['model']['name'])
