@@ -6,7 +6,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 from typing import Any
-from ssl_neuron.PV_Space import PVFC, PVManifoldMLR,PV_layer_norm, PVManifold, PVFC_2, PVMLR_2, _pv_dist
+from ssl_neuron.PV_Space import PVFC, PVManifoldMLR,PV_layer_norm, PVBatchNorm, PVBatchNormTrafo, PVManifold, PVFC_2, PVMLR_2, _pv_dist
 
 class GraphAttention(nn.Module):
     """ Implements GraphAttention.
@@ -96,9 +96,9 @@ class HyperbolicGraphAttention(nn.Module):
                  bias: bool = False,
                  k: float = -1.0,
                  use_exp: bool = True,
-                 hyperbolic_linear: str = 'gyro',
+                 hyperbolic_linear: str = 'planes',
                  attention_scores: str = 'squaredist',
-                 value_accredition: str = 'standard'
+                 value_aggregation: str = 'standard'
                  ) -> nn.Module:
         super().__init__()
 
@@ -111,11 +111,13 @@ class HyperbolicGraphAttention(nn.Module):
         if hyperbolic_linear == 'gyro':
             self.qkv_projection = PVFC_2(k=self.k, in_features=dim, out_features=dim * num_heads * 3, use_bias=bias, act=None)
             self.proj = PVFC_2(k=self.k, in_features=dim * num_heads, out_features=dim, use_bias=bias, act=None)
-        if hyperbolic_linear == 'planes':
+        elif hyperbolic_linear == 'planes':
             self.qkv_projection = PVFC(k=self.k, in_features=dim, out_features=dim * num_heads * 3, use_bias=bias, act=None)
             self.proj = PVFC(k=self.k, in_features=dim * num_heads, out_features=dim, use_bias=bias, act=None)
+        else: 
+            raise ValueError(f"Unsupported hyperbolic_linear '{hyperbolic_linear}'. Valid options are: ['gyro', 'planes']")
         self.attention_scores=attention_scores
-        self.value_accredition=value_accredition
+        self.value_aggregation=value_aggregation
         # Weigth to trade of local vs. global attention.
         self.predict_gamma = nn.Linear(dim, 2)
         # Initialize projection such that gamma is close to 1
@@ -152,14 +154,12 @@ class HyperbolicGraphAttention(nn.Module):
         attn = self.fused_mul_add(gamma[:, :, :, 0:1], attn, gamma[:, :, :, 1:2], adj)
         
         attn = attn.softmax(dim=-1)
-        if self.value_accredition == "standard":
+        if self.value_aggregation == "standard":
             x= (attn @ value).transpose(1, 2).reshape(B, N, -1) # (batch_size x num_nodes x (num_heads * dim))
-        elif self.value_accredition == "Lorentzian_centroid":
-            vals=attn @ value
-            norms=torch.clamp(self.manifold.Lorentz_norm(vals), min=1e-12)
-            x = self.manifold.s *  (vals/norms).transpose(1, 2).reshape(B, N, -1) # (batch_size x num_nodes x (num_heads * dim))
+        elif self.value_aggregation == "Lorentzian_centroid":
+            x=self.manifold.Lorentz_midpoint(xs=value, weights=attn).transpose(1, 2).reshape(B, N, -1) # (batch_size x num_nodes x (num_heads * dim))
         else:
-            raise ValueError(f"Unsupported valueaccredition '{self.value_accredition}'. Valid options are: ['standard', 'Lorentzian_centroid']")
+            raise ValueError(f"Unsupported valueaggregation '{self.value_aggregation}'. Valid options are: ['standard', 'Lorentzian_centroid']")
         return self.proj(x)
     
 class MLP(nn.Module):
@@ -198,19 +198,37 @@ class AttentionBlock(nn.Module):
                  mlp_ratio: int = 4,
                  bias: bool = False,
                  use_exp: bool = True,
-                 norm_layer: Any = nn.LayerNorm) -> nn.Module:
+                 norm_layer: Any = nn.LayerNorm,
+                 rescon: str = 'standard') -> nn.Module:
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
         self.mlp = MLP(dim=dim, hidden_dim=dim * mlp_ratio)
         self.attn = GraphAttention( dim=dim, num_heads=num_heads, bias=bias, use_exp=use_exp )
-        
-
+        self.rescon=rescon
+        if self.rescon=='weighted_standard':
+            self.delta=nn.Parameter(torch.tensor(1.0))
+            self.res_scale_att=nn.Parameter(torch.tensor(1.0))
+            self.res_scale_mlp=nn.Parameter(torch.tensor(1.0))
+        elif self.rescon=='standard':
+            pass    
+        else:
+            raise ValueError(f"Unsupported residual connection method '{self.rescon}'. Valid options are: ['weighted_standard', 'standard']")
     def forward(self, x, a):
-        x = self.norm1(x)
-        x = x + self.attn(x, a)
-        x = self.norm2(x)
-        x = x + self.mlp(x)
+        if self.rescon== 'standard':
+            x = self.norm1(x)
+            x = x + self.attn(x, a)
+            x = self.norm2(x)
+            x = x + self.mlp(x)
+        elif self.rescon== 'weighted_standard':
+            residual=x
+            x=self.norm1(x)
+            x=self.delta*(residual+self.res_scale_att*self.attn(x,a))
+            residual=x
+            x=self.norm2(x)
+            x=self.delta*(residual+self.res_scale_mlp*self.mlp(x))
+        else:
+            raise ValueError(f"Unsupported residual connection method '{self.rescon}'. Valid options are: ['weighted_standard', 'standard']")
         return x
 class HyperbolicAttentionBlock(nn.Module):
     """ Implements an attention block.
@@ -224,7 +242,9 @@ class HyperbolicAttentionBlock(nn.Module):
                  use_exp: bool = True,
                  hyperbolic_linear: str = 'gyro',
                  attention_scores: str = 'squaredist',
-                 value_accredition: str = 'standard',
+                 value_aggregation: str = 'standard',
+                 batch_norm: bool = False,
+                 n_nodes: int =1000,
                  rescon: str = 'weighted_geodesic_midpoint'
                  ) -> nn.Module:
         super().__init__()
@@ -240,27 +260,45 @@ class HyperbolicAttentionBlock(nn.Module):
             self.res_scale_att = nn.Parameter(torch.tensor(1.0))
             self.res_scale_mlp = nn.Parameter(torch.tensor(1.0))
             self.delta = nn.Parameter(torch.tensor(float(1.0)))
+        elif self.rescon =='geodesic_midpoint':
+            self.res_scale_att = 0.0
+            self.res_scale_mlp = 0.0
+            self.delta = 1.0
+        elif self.rescon == 'gyroaddition':
+            self.res_scale_att = 1.0
+            self.res_scale_mlp = 1.0
+            self.delta = 1.0
+        elif self.rescon == 'weighted_standard':
+            self.res_scale_att=nn.Parameter(torch.tensor(1.0))
+            self.res_scale_mlp=nn.Parameter(torch.tensor(1.0))
+            self.delta=nn.Parameter(torch.tensor(1.0))
+        elif self.rescon == 'standard':
+            self.res_scale_att=1.0
+            self.res_scale_mlp=1.0
+            self.delta=1.0
         else: 
-            raise ValueError(f"Unsupported residual connection method '{self.rescon}'. Valid options are: ['weighted_geodesic_midpoint', 'weighted_gyroaddition']")
-        self.norm1 = PV_layer_norm(k=k, dimension=dim)
-        self.norm2 = PV_layer_norm(k=k, dimension=dim)
+            raise ValueError(f"Unsupported residual connection method '{self.rescon}'. Valid options are: ['weighted_geodesic_midpoint', 'weighted_gyroaddition', 'weighted_standard', 'geodesic_midpoint', 'gyroaddition', 'standard']")
+        if batch_norm:
+            self.norm1 = PVBatchNormTrafo(k=k, N=201, dim=dim)
+            self.norm2= PVBatchNormTrafo(k=k, N=201, dim=dim)
+        else:
+            self.norm1 = PV_layer_norm(k=k, dimension=dim)
+            self.norm2 = PV_layer_norm(k=k, dimension=dim)
         self.mlp = Hyp_MLP(dim=dim, hidden_dim=dim * mlp_ratio, k=k, hyperbolic_linear=hyperbolic_linear)
-        self.attn = HyperbolicGraphAttention(k=k, dim=dim, num_heads=num_heads, bias=bias, use_exp=use_exp, hyperbolic_linear=hyperbolic_linear, attention_scores=attention_scores, value_accredition=value_accredition)
+        self.attn = HyperbolicGraphAttention(k=k, dim=dim, num_heads=num_heads, bias=bias, use_exp=use_exp, hyperbolic_linear=hyperbolic_linear, attention_scores=attention_scores, value_aggregation=value_aggregation)
         
 
     def forward(self, x, a):
-        if self.rescon== 'weighted_geodesic_midpoint':
+        if (self.rescon== 'weighted_geodesic_midpoint' or self.rescon== 'geodesic_midpoint'):
             residual = x
             x = self.norm1(x)
-            x =  self.manifold.Residual(residual, self.attn(x, a), alpha=torch.sigmoid(self.res_scale_att))
+            x =  self.manifold.geodesic_mid(residual, self.attn(x, a), alpha=torch.sigmoid(self.res_scale_att))
             x=self.manifold.gyro_scalar_mul( self.delta, x)
             residual = x
             x = self.norm2(x)
-            x = self.manifold.Residual(residual , self.mlp(x), alpha=torch.sigmoid(self.res_scale_mlp))
+            x = self.manifold.geodesic_mid(residual , self.mlp(x), alpha=torch.sigmoid(self.res_scale_mlp))
             x=self.manifold.gyro_scalar_mul(self.delta, x)
-
-        
-        elif self.rescon == 'weighted_gyroaddition':
+        elif (self.rescon == 'weighted_gyroaddition' or self.rescon=='gyroaddition'):
             residual= x
             x=self.norm1(x)
             x=self.manifold.gyro_add(residual,self.manifold.gyro_scalar_mul(self.res_scale_att, self.attn(x, a)) )
@@ -270,6 +308,13 @@ class HyperbolicAttentionBlock(nn.Module):
 
             x=self.manifold.gyro_add(residual, self.manifold.gyro_scalar_mul(self.res_scale_mlp,self.mlp(x)))
             x=self.manifold.gyro_scalar_mul(self.delta, x)
+        elif (self.rescon=='weighted_standard' or self.rescon== 'standard'):
+            residual=x
+            x= self.norm1(x)
+            x=self.delta*(self.res_scale_att*self.attn(x,a)+residual)
+            residual=x
+            x=self.norm2(x)
+            x=self.delta*(self.res_scale_mlp*self.mlp(x)+residual)
         else:
             raise ValueError(f"Unsupported residual connection method '{self.rescon}'. Valid options are: ['weighted_geodesic_midpoint', 'weighted_gyroaddition']")
         return x
@@ -277,7 +322,7 @@ class HyperbolicAttentionBlock(nn.Module):
     
 class GraphTransformer(nn.Module):
     def __init__(self,
-                 n_nodes: int = 200,
+                 n_nodes: int = 1000,
                  dim: int = 32,
                  hyp_depth: int = 0,
                  euc_depth: int = 5,
@@ -289,15 +334,18 @@ class GraphTransformer(nn.Module):
                  proj_dim: int = 128,
                  num_proj_layers: int = 3,
                  use_exp: bool = True,
+                 hyperbolic_pos = False,
                  hyperbolic_Projection: bool = False,
                  hyperbolic_linear: str = 'planes',
+                 batch_norm: bool = False,
                  attention_scores: str = 'squaredist',
                  rescon: str = 'weighted_geodesic_midpoint',
-                 value_accredition: str = 'standard',
-                 loc_embedding: int = 0,
+                 value_aggregation: str = 'standard',
                  k: float = -1.0,
                  loss_function: str = 'cross_entropy') -> nn.Module:
         super().__init__()
+        self.manifold=PVManifold(k=k)
+        self.hyperbolic_pos=hyperbolic_pos
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.cls_pos_embedding = nn.Parameter(torch.randn(1, 1, dim))
         if hyperbolic_linear == 'gyro':
@@ -308,15 +356,19 @@ class GraphTransformer(nn.Module):
             self.hyperbolic_classifier=PVManifoldMLR
         self.k=k
         self.blocks = nn.Sequential(*[
-            AttentionBlock( dim=dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_exp=use_exp)
-            for i in range(euc_depth)], *[HyperbolicAttentionBlock(k=self.k, dim=dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_exp=use_exp, hyperbolic_linear=hyperbolic_linear, attention_scores=attention_scores, value_accredition=value_accredition, rescon=rescon)
+            AttentionBlock( dim=dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_exp=use_exp, rescon=rescon)
+            for i in range(euc_depth)], *[HyperbolicAttentionBlock(k=self.k, dim=dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_exp=use_exp, hyperbolic_linear=hyperbolic_linear, attention_scores=attention_scores, value_aggregation=value_aggregation, rescon=rescon, batch_norm=batch_norm)
             for i in range(hyp_depth)])
 
-        self.to_pos_embedding = nn.Linear(pos_dim, dim)
 
         if hyp_depth>0:
-
-            self.mlp_head = nn.Sequential(
+            if batch_norm:
+                self.mlp_head = nn.Sequential(
+                                PVBatchNorm(k=self.k,dim=dim),
+                                self.hyperbolic_linear(in_features=dim, out_features=dim, k=self.k, use_bias=True)
+                                )
+            else:
+                self.mlp_head = nn.Sequential(
                 PV_layer_norm(k=self.k, dimension=dim),
                 self.hyperbolic_linear(in_features=dim, out_features=dim, k=self.k, use_bias=True)
                 )
@@ -333,7 +385,10 @@ class GraphTransformer(nn.Module):
                 projector_layers.append(self.hyperbolic_linear(in_features=dim,  out_features=proj_dim, k=self.k, use_bias=True, act='gelu'))
                 for _ in range(num_proj_layers-1):
                     projector_layers.append(self.hyperbolic_linear(in_features=proj_dim,  out_features=proj_dim, k=self.k, use_bias=True, act='gelu'))
-            projector_layers.append(PV_layer_norm(k=self.k, dimension=proj_dim))
+            if batch_norm:
+                projector_layers.append(PVBatchNorm(k=self.k,dim=proj_dim))
+            else:
+                projector_layers.append(PV_layer_norm(k=self.k, dimension=proj_dim))
             
             if loss_function == 'cross_entropy':
                 projector_layers.append(self.hyperbolic_classifier(in_features=proj_dim,  num_classes=num_classes, k=self.k))
@@ -360,36 +415,73 @@ class GraphTransformer(nn.Module):
             projector_layers.append(nn.LayerNorm(proj_dim))
             projector_layers.append(nn.Linear(proj_dim, num_classes))
             self.projector=nn.Sequential(*projector_layers)
+        if self.hyperbolic_pos:
 
-        self.to_node_embedding = nn.Sequential(
+            self.to_node_embedding = nn.Sequential(
+                        self.hyperbolic_linear(in_features=feat_dim, out_features=2*dim, k=self.k, use_bias=True, act='relu'),
+                        self.hyperbolic_linear(in_features=2*dim, out_features=dim, k=self.k, use_bias=True)
+                    )
+            self.to_pos_embedding =self.hyperbolic_linear(in_features=pos_dim, out_features=dim, k=self.k, use_bias=True)
+          
+            self.scale=nn.Parameter(torch.tensor(1.0))
+        else:        
+            self.to_pos_embedding = nn.Linear(pos_dim, dim)
+            self.to_node_embedding = nn.Sequential(
             nn.Linear(feat_dim, dim * 2),
             nn.ReLU(True),
             nn.Linear(dim * 2, dim)
-        )
-
+            )
+        self.pos_weight=nn.Parameter(torch.tensor(1.0))
+        self.feat_weight=nn.Parameter(torch.tensor(1.0))
     def forward(self, node_feat, adj, lapl, loc_embedding):
         B, N, _ = node_feat.shape
 
-        # Compute initial node embedding.
-        x = self.to_node_embedding(node_feat)
+        if self.hyperbolic_pos:
+            # Compute initial node embedding.
+            x=self.manifold.expmap0(self.scale * node_feat)
+            x = self.to_node_embedding(x)
+            
+            
+            
+            # Compute positional encoding
+            pos_embedding_token = self.to_pos_embedding(self.manifold.expmap0(lapl))
+            # Add "classification" token
+            cls_pos_enc = self.cls_pos_embedding.repeat(B, 1, 1)
+            pos_embedding = torch.cat((cls_pos_enc, pos_embedding_token), dim=1)
 
-        # Compute positional encoding
-        pos_embedding_token = self.to_pos_embedding(lapl)
+            cls_tokens = self.cls_token.repeat(B, 1, 1)
+            x = torch.cat((cls_tokens, x), dim=1)
+            
+            # Add classification token entry to adjanceny matrix. 
+            adj_cls = torch.zeros(B, N + 1, N + 1, device=node_feat.device)
+            # TODO(test if useful)
+            adj_cls[:, 0, 0] = 1.
+            adj_cls[:, 1:, 1:] = adj
 
-        # Add "classification" token
-        cls_pos_enc = self.cls_pos_embedding.repeat(B, 1, 1)
-        pos_embedding = torch.cat((cls_pos_enc, pos_embedding_token), dim=1)
+            x=self.manifold.gyro_add(self.manifold.gyro_scalar_mul(self.feat_weight, x), self.manifold.gyro_scalar_mul(self.pos_weight,pos_embedding))            
+        else:
+            # Compute initial node embedding.
+            x = self.to_node_embedding(node_feat)
 
-        cls_tokens = self.cls_token.repeat(B, 1, 1)
-        x = torch.cat((cls_tokens, x), dim=1)
+            # Compute positional encoding
+            pos_embedding_token = self.to_pos_embedding(lapl)
+
+            # Add "classification" token
+            cls_pos_enc = self.cls_pos_embedding.repeat(B, 1, 1)
+            pos_embedding = torch.cat((cls_pos_enc, pos_embedding_token), dim=1)
+
+            cls_tokens = self.cls_token.repeat(B, 1, 1)
+            x = torch.cat((cls_tokens, x), dim=1)
+            
+            # Add classification token entry to adjanceny matrix. 
+            adj_cls = torch.zeros(B, N + 1, N + 1, device=node_feat.device)
+            # TODO(test if useful)
+            adj_cls[:, 0, 0] = 1.
+            adj_cls[:, 1:, 1:] = adj
+
+            x = self.feat_weight*x+self.pos_weight*pos_embedding
         
-        # Add classification token entry to adjanceny matrix. 
-        adj_cls = torch.zeros(B, N + 1, N + 1, device=node_feat.device)
-        # TODO(test if useful)
-        adj_cls[:, 0, 0] = 1.
-        adj_cls[:, 1:, 1:] = adj
-
-        x += pos_embedding
+        
 
         for block in self.blocks:
             x = block(x, adj_cls)
@@ -597,9 +689,11 @@ def create_model(config):
                  num_classes=num_classes,
                  hyperbolic_Projection=config['model']['hyperbolic_Projection'],
                  hyperbolic_linear=config['model']['hyperbolic_linear'],
+                 hyperbolic_pos=config['model']['hyperbolic_pos'],
                  attention_scores=config['model']['attention_scores'],
-                 value_accredition=config['model']['value_accredition'],
+                 value_aggregation=config['model']['value_aggregation'],
                  rescon=config['model']['rescon'],
+                 batch_norm=config['model']['batch_norm'],
                  num_proj_layers=config['model']['num_proj_layers'],
                  loc_embedding=config['testing']['loc_embedding'],
                  loss_function=config['model']['loss_function'],

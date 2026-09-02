@@ -148,7 +148,7 @@ def _pv_Lorentz_prod(x: torch.Tensor, y: torch.Tensor, k: float, tiny: float) ->
     return x0 * y0 - (x * y).sum(dim=-1, keepdim=True)
 def _pv_Lorentz_norm(x: torch.Tensor, k: float, tiny: float):
     return torch.sqrt(torch.clamp(torch.abs(_pv_Lorentz_prod(x, x, k, tiny)), min=tiny))
-def _pv_Residual(x: torch.Tensor, y: torch.Tensor, alpha: float, k: float, neg_k: float, s: float, tiny: float) -> torch.Tensor:
+def _pv_geodesic_mid(x: torch.Tensor, y: torch.Tensor, alpha: float, k: float, neg_k: float, s: float, tiny: float) -> torch.Tensor:
     return _pv_exp_map(x, _pv_log_map(x, y, k, neg_k, s, tiny) * alpha, k, neg_k, np.sqrt(neg_k), tiny)
 # ---------- Core Factors ----------
 def beta(x: torch.Tensor, k: float) -> torch.Tensor:
@@ -159,6 +159,10 @@ def beta(x: torch.Tensor, k: float) -> torch.Tensor:
     """
     return _pv_beta(x, k, TINY)
 
+def Minkowski_product(x,y) -> torch.Tensor:
+    return x[...,0]*y[...,0]-(x[...,1:]*y[...,1:]).sum(dim=-1)
+def Minkowski_norm(x) -> torch.Tensor:
+    return torch.sqrt(torch.clamp(torch.abs(Minkowski_product(x,x)), min=TINY))
 # ---------- Small-angle Helpers ----------
 def _sinhc(z: torch.Tensor) -> torch.Tensor:
     """Computes sinh(z)/z numerically stable around 0."""
@@ -287,8 +291,23 @@ class PVManifold:
         return _pv_Lorentz_prod(x, y, self.k, TINY)
     def Lorentz_norm(self, x: torch.Tensor):
         return _pv_Lorentz_norm(x, self.k, TINY)
-    def Residual(self, x: torch.Tensor, y: torch.Tensor, alpha: float) -> torch.Tensor:
-        return _pv_Residual(x, y, alpha, self.k, self.neg_k, self.s, TINY)
+    def geodesic_mid(self, x: torch.Tensor, y: torch.Tensor, alpha: float) -> torch.Tensor:
+        return _pv_geodesic_mid(x, y, alpha, self.k, self.neg_k, self.s, TINY)
+    
+    def Lorentz_midpoint(self, xs: torch.Tensor, weights: torch.Tensor= None) -> torch.Tensor:
+        """Lorentz barycenter via ambient sum. Uniform if weights is None, else weighted sum."""
+        if weights is None:
+            num = xs.sum(dim=-2)
+            t_sum=torch.sqrt(torch.clamp((xs*xs).sum(dim=-1)-1/self.k, min=TINY)).sum(dim=-1)
+            denom= self.sqrt_neg_k*torch.clamp(Minkowski_norm(torch.cat((t_sum.unsqueeze(-1),num), axis=-1)), min=1e-12)
+            return num / denom.unsqueeze(-1)
+        else: 
+            ts=torch.sqrt(torch.clamp((xs*xs).sum(dim=-1)-1/self.k, min=TINY))
+            ys=torch.cat((ts.unsqueeze(-1),xs), axis=-1)
+            num= weights @ ys
+            denom= self.sqrt_neg_k*torch.clamp(Minkowski_norm(num), min=1e-12)
+            return num[..., 1:] / denom.unsqueeze(-1)
+            
 
 # =====================================================================
 #                  PV Multinomial Logistic Regression
@@ -319,8 +338,8 @@ class PVManifoldMLR(nn.Module):
 
     def reset_parameters(self):
         # Initialization
-        nn.init.normal_(self.z, mean=0.0, std=1e-2)
-        nn.init.uniform_(self.r, a=-1e-3, b=1e-3)
+        nn.init.normal_(self.z, mean=0.0, std=1/self.d)#nn.init.normal_(self.z, mean=0.0, std=1e-2)
+        nn.init.uniform_(self.r, a=-1/self.d, b=1/self.d)#nn.init.uniform_(self.r, a=-1e-3, b=1e-3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -642,3 +661,123 @@ class PVMLR_2(nn.Module):
         
             
         return x
+
+class PVBatchNormTrafo(nn.Module):
+
+    def __init__(self, k: float , N: int, dim: int , momentum: float=0.1, normalize_variance: bool=False, clamp_scale: bool= True):
+        super().__init__()
+        self.k=k
+        self.dim=dim
+        self.manifold=PVManifold(k=k)
+        self.momentum=momentum
+        self.normalize_variance=normalize_variance
+        self.clamp_scale=clamp_scale 
+        self.beta=nn.Parameter(torch.zeros(dim))
+        self.gamma=nn.Parameter(torch.ones(1))
+        self.register_buffer('running_mean', torch.zeros((N,dim)))
+        self.register_buffer('running_var', torch.ones(N))
+
+    def forward(self,x):
+        B, N, _= x.shape
+        x=x.permute(1,0,2) #[N, B, d]
+       
+        if self.training:
+            # Fréchet mean approximation via Lorentz midpoint
+            mean= self.manifold.Lorentz_midpoint(x) #[N,d]
+
+            if self.normalize_variance:
+                var = (self.manifold.dist(x, mean.unsqueeze(1)) ** 2).mean(dim=-1) # [N]
+                div_factor = torch.sqrt(var + TINY)     #[N]
+            else:
+                var = None
+                div_factor = 1.0
+            centered_x=self.manifold.gyro_add((self.manifold.gyro_neg(mean)).unsqueeze(1), x) #[N,B,d]
+            scale = self.gamma.unsqueeze(0) / div_factor #[1,1]
+            if self.clamp_scale and self.normalize_variance:
+                scale = torch.clamp(scale, min=0.5, max=2.0)
+            scaled_x = self.manifold.gyro_scalar_mul(scale.unsqueeze(1), centered_x)
+            with torch.no_grad():
+               
+                self.running_mean.copy_(
+                    self.manifold.geodesic_mid(self.running_mean, mean.detach(), alpha=self.momentum)
+                )
+                if self.normalize_variance and var is not None:
+                    self.running_var.copy_(
+                        (1.0 - self.momentum) * self.running_var
+                        + self.momentum * var.detach()
+                    )
+        else:
+            centered_x=self.manifold.gyro_add((self.manifold.gyro_neg(self.running_mean)).unsqueeze(1), x) #[N,B,d]
+
+            div_factor = (
+                torch.sqrt(self.running_var + TINY)
+                if self.normalize_variance else 1.0
+            )
+            scale = self.gamma.unsqueeze(0) / div_factor
+            if self.clamp_scale and self.normalize_variance:
+                scale = torch.clamp(scale, min=0.5, max=2.0)
+            scaled_x = self.manifold.gyro_scalar_mul(scale.unsqueeze(1), centered_x)
+
+        final_x=self.manifold.gyro_add((self.beta.unsqueeze(0)).unsqueeze(0),scaled_x)
+
+        return final_x.permute(1,0,2)                  
+
+
+class PVBatchNorm(nn.Module):
+
+    def __init__(self, k: float ,  dim: int , momentum: float=0.1, normalize_variance: bool=False, clamp_scale: bool= True):
+        super().__init__()
+        self.k=k
+        self.dim=dim
+        self.manifold=PVManifold(k=k)
+        self.momentum=momentum
+        self.normalize_variance=normalize_variance
+        self.clamp_scale=clamp_scale 
+        self.beta=nn.Parameter(torch.zeros(dim))
+        self.gamma=nn.Parameter(torch.ones(1))
+        self.register_buffer('running_mean', torch.zeros(dim))
+        self.register_buffer('running_var', torch.ones(1))
+
+    def forward(self,x):
+        #[B, d]
+       
+        if self.training:
+            # Fréchet mean approximation via Lorentz midpoint
+            mean= self.manifold.Lorentz_midpoint(x) #[N,d]
+
+            if self.normalize_variance:
+                var = (self.manifold.dist(x, mean.unsqueeze(1)) ** 2).mean(dim=-1) # 
+                div_factor = torch.sqrt(var + TINY)     #
+            else:
+                var = None
+                div_factor = 1.0
+            centered_x=self.manifold.gyro_add((self.manifold.gyro_neg(mean)).unsqueeze(0), x) #[B,d]
+            scale = self.gamma.unsqueeze(0) / div_factor #[1,1]
+            if self.clamp_scale and self.normalize_variance:
+                scale = torch.clamp(scale, min=0.5, max=2.0)
+            scaled_x = self.manifold.gyro_scalar_mul(scale, centered_x)
+            with torch.no_grad():
+               
+                self.running_mean.copy_(
+                    self.manifold.geodesic_mid(self.running_mean, mean.detach(), alpha=self.momentum)
+                )
+                if self.normalize_variance and var is not None:
+                    self.running_var.copy_(
+                        (1.0 - self.momentum) * self.running_var
+                        + self.momentum * var.detach()
+                    )
+        else:
+            centered_x=self.manifold.gyro_add((self.manifold.gyro_neg(self.running_mean)).unsqueeze(0), x) #[B,d]
+
+            div_factor = (
+                torch.sqrt(self.running_var + TINY)
+                if self.normalize_variance else 1.0
+            )
+            scale = self.gamma.unsqueeze(0) / div_factor
+            if self.clamp_scale and self.normalize_variance:
+                scale = torch.clamp(scale, min=0.5, max=2.0)
+            scaled_x = self.manifold.gyro_scalar_mul(scale, centered_x)
+
+        final_x=self.manifold.gyro_add(self.beta.unsqueeze(0),scaled_x)
+
+        return final_x

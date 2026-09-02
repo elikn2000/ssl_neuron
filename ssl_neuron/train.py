@@ -13,15 +13,16 @@ class Trainer(object):
         self.model_name = config['model']['name']
         self.ckpt_dir = config['trainer']['ckpt_dir']
         self.save_every = config['trainer']['save_ckpt_every']
-        self.plot_latents_every = config['trainer']['plot_latents_every']
-        self.classification_every = config['trainer']['classification_every']
+        self.classification_every = config['validation']['classification_every']
+        self.validation_loss=config['validation']['validation_loss']
         ### datasets
         self.train_loader = dataloaders[0]
         self.val_loader= dataloaders[1]
-        self.loc_embedding=config['trainer']['loc_embedding']
         ### trainings params
         self.max_iter = config['optimizer']['max_iter']
         self.init_lr = config['optimizer']['lr']
+        self.lr_decay_factor=config['optimizer']['lr_scheduler']['factor']
+        
         self.exp_decay = config['optimizer']['exp_decay']
         self.lr_warmup = torch.linspace(0., self.init_lr,  steps=(self.max_iter // 50)+1)[1:]
         self.lr_decay = self.max_iter // 5
@@ -42,7 +43,10 @@ class Trainer(object):
             )
         else:
             self.lr_scheduler = None
-        
+        self.early_stopping_enabled=config['trainer']['early_stopping']['enabled']
+        self.max_lr_decays=config['trainer']['early_stopping']['max_lr_decays']
+        self.best_val_acc=0
+       
       
     def set_lr(self): 
         if self.curr_iter < len(self.lr_warmup):
@@ -64,17 +68,20 @@ class Trainer(object):
     def train(self):     
         self.curr_iter = 0
         epoch = 0
-        while self.curr_iter < self.max_iter:
+        self.lr=self.set_lr()
+
+        while self.curr_iter < self.max_iter and (self.lr>self.init_lr*(self.lr_decay_factor**self.max_lr_decays)-1e-6 or self.early_stopping_enabled==False or self.curr_iter<len(self.lr_warmup)):
             # Run one epoch.
             self._train_epoch(epoch)
 
-            if epoch % self.save_every == 0:
+            if (self.save_every >0 and epoch % self.save_every == 0):
                 # Save checkpoint.
                 self._save_checkpoint(epoch)
            
 
             epoch += 1
-        self._save_checkpoint(epoch)
+        
+        
 
     def _train_epoch(self, epoch):
         self.model.train()
@@ -91,7 +98,7 @@ class Trainer(object):
             
             self.lr = self.set_lr()
             self.optimizer.zero_grad(set_to_none=True)
-            loss, max_val_batch, teacher_logits_avg_avg = self.model(f1, f2, a1, a2, l1, l2, self.loc_embedding)
+            loss, max_val_batch, teacher_logits_avg_avg = self.model(f1, f2, a1, a2, l1, l2,0)
             max_val= max(max_val, max_val_batch)    
 
             # optimize 
@@ -112,27 +119,38 @@ class Trainer(object):
         wandb.log({'lr': self.lr})
         wandb.log({'epoch': epoch})
         self.model.eval()
-        val_losses = AverageMeter()
-        with torch.no_grad():
-            for data in self.val_loader:
-                f1, f2, a1, a2 = [x.float().to(self.device, non_blocking=True) for x in data]
-                n = a1.shape[0]
+        if self.validation_loss:
+            val_losses = AverageMeter()
+            with torch.no_grad():
+                for data in self.val_loader:
+                    f1, f2, a1, a2 = [x.float().to(self.device, non_blocking=True) for x in data]
+                    n = a1.shape[0]
 
-                l1 = compute_eig_lapl_torch_batch(a1)
-                l2 = compute_eig_lapl_torch_batch(a2)
+                    l1 = compute_eig_lapl_torch_batch(a1)
+                    l2 = compute_eig_lapl_torch_batch(a2)
 
-                loss, _, _ = self.model(f1, f2, a1, a2, l1, l2, self.loc_embedding)
-                val_losses.update(loss.detach(), n)
+                    loss, _, _ = self.model(f1, f2, a1, a2, l1, l2, 0)
+                    val_losses.update(loss.detach(), n)
 
-        wandb.log({'loss_val': val_losses.avg})
+            wandb.log({'loss_val': val_losses.avg})
         if self.lr_scheduler is not None:
             self.lr_scheduler.step(val_losses.avg)
         wandb.log({'lr': self.optimizer.param_groups[0]['lr']})
 
         if (self.classification_every > 0 and epoch % self.classification_every == 0):
-            run_cell_type_eval(self.model, self.train_loader.dataset, self.val_loader.dataset, self.model_name, self.device,  method=self.config['testing']['Classifier'], num_hidden=self.config['testing']['num_hidden'], dim_hidden=self.config['testing']['dim_hidden'], embedding=self.config['testing']['embedding'], save_embedding_label=False, to_wandb=True, save_model=False, save_confusion_matrix=False, loc_embedding=0, k=self.config['model']['curvature'])
-        elif self.curr_iter == self.max_iter - 1:
-            run_cell_type_eval(self.model, self.train_loader.dataset, self.val_loader.dataset, self.model_name, self.device,  method=self.config['testing']['Classifier'], num_hidden=self.config['testing']['num_hidden'], dim_hidden=self.config['testing']['dim_hidden'], embedding=self.config['testing']['embedding'], save_embedding_label=self.config['testing']['save_embedding_label'], to_wandb=self.config['testing']['to_wandb'], save_model=self.config['testing']['save_model'], save_confusion_matrix=self.config['testing']['save_confusion_matrix'], loc_embedding=0, k=self.config['model']['curvature'])
+            val_acc=run_cell_type_eval(self.model, self.train_loader.dataset, self.val_loader.dataset, self.model_name, self.device,  method=self.config['testing']['Classifier'], num_hidden=self.config['testing']['num_hidden'], dim_hidden=self.config['testing']['dim_hidden'], embedding=self.config['testing']['embedding'], save_embedding_label=False, to_wandb=True, save_model=False, save_confusion_matrix=False, loc_embedding=0, k=self.config['model']['curvature'])
+        # elif self.curr_iter >= self.max_iter and self.config['testing']['final_testing']:
+        #     val_acc=run_cell_type_eval(self.model, self.train_loader.dataset, self.val_loader.dataset, self.model_name, self.device,  method=self.config['testing']['Classifier'], num_hidden=self.config['testing']['num_hidden'], dim_hidden=self.config['testing']['dim_hidden'], embedding=self.config['testing']['embedding'], save_embedding_label=self.config['testing']['save_embedding_label'], to_wandb=self.config['testing']['to_wandb'], save_model=self.config['testing']['save_model'], save_confusion_matrix=self.config['testing']['save_confusion_matrix'], loc_embedding=0, k=self.config['model']['curvature'])
+            
+            if val_acc > self.best_val_acc:
+
+            # Improvement
+                self.best_val_acc = val_acc
+
+            # Save complete training state
+            
+                self._save_best_model()
+
         self.model.train()
 
     def _save_checkpoint(self, epoch):
@@ -140,3 +158,8 @@ class Trainer(object):
         PATH = os.path.join(self.ckpt_dir, filename)
         torch.save(self.model.state_dict(), PATH)
         print('Save model after epoch {} as {}.'.format(epoch, filename))
+    def _save_best_model(self):
+        filename = '{}_best.pt'.format(self.model_name)
+        PATH= os.path.join(self.ckpt_dir, filename)
+        torch.save(self.model.state_dict(),PATH)
+        print('Save new best model as {}.'.format(filename))

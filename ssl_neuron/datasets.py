@@ -15,13 +15,14 @@ class GraphDataset(Dataset):
     position is (0, 0, 0) and axons have been removed. Node positions
     are assumed to be in microns and y-axis is orthogonal to the pia.
     """
-    def __init__(self, config, mode='train', inference=False, max_samples=None):
+    def __init__(self, config, mode='train', inference=False, max_samples=None, normalize=True):
 
         self.config = config
         self.mode = mode
         self.inference = inference
         data_path = config['data']['path']
-
+        self.mean=np.zeros(3)
+        self.std=1
         # Augmentation parameters.
         self.jitter_var = config['data']['jitter_var']
         self.rotation_axis = config['data']['rotation_axis']
@@ -79,7 +80,11 @@ class GraphDataset(Dataset):
                 count += 1
 
         self.num_samples = len(self.cells)
-
+        self.mean=np.zeros((self.__len__(),3))
+        self.std=1
+        if normalize:
+            self.mean, self.std=self.mean_std()
+            
     def __len__(self):
         return self.num_samples
 
@@ -151,7 +156,7 @@ class GraphDataset(Dataset):
     
     def __getsingleitem__(self, index): 
         cell = self.cells[index]
-        return cell['features'], cell['neighbors']
+        return (cell['features']-np.expand_dims(self.mean[index],axis=0))/self.std, cell['neighbors']
     
     
     def __getitem__(self, index): 
@@ -161,8 +166,34 @@ class GraphDataset(Dataset):
         features1, adj_matrix1 = self._augment(cell)
         features2, adj_matrix2 = self._augment(cell)
 
-        return features1, features2, adj_matrix1, adj_matrix2
+        return (features1-np.expand_dims(self.mean[index],axis=0))/self.std, (features2-np.expand_dims(self.mean[index],axis=0))/self.std, adj_matrix1, adj_matrix2
     
+    def mean_std(self):
+        # mean = np.zeros(3)
+        # sum_sq = np.zeros(3)
+        # total_num_nodes = 0
+
+        # for i in range(len(self)):
+        #     feat = self.__getsingleitem__(i)[0]
+
+        #     mean += np.sum(feat,axis=0)
+        #     sum_sq +=np.sum(feat ** 2, axis=0)
+        #     total_num_nodes += feat.shape[0]
+
+        # mean /= total_num_nodes
+
+        # var = np.sum(sum_sq / total_num_nodes - mean ** 2)/3
+        # std = np.sqrt(var)
+        mean=np.zeros((self.__len__(),3))
+        var = 0
+        total_num_nodes = 0
+        for i in range(self.__len__()):
+            feat = self.__getsingleitem__(i)[0]
+            num_nodes=feat.shape[0]
+            mean[i] = np.sum(feat,axis=0)/num_nodes
+            var +=np.sum(feat ** 2)-num_nodes*np.sum(mean[i]**2)
+            total_num_nodes += num_nodes
+        return mean, np.sqrt(var/total_num_nodes)
 
 def build_dataloader(config, use_cuda=torch.cuda.is_available(), test=False):
     if test:
@@ -174,13 +205,13 @@ def build_dataloader(config, use_cuda=torch.cuda.is_available(), test=False):
     kwargs = {'num_workers':config['data']['num_workers'], 'pin_memory':True, 'persistent_workers': True} if use_cuda else {}
 
     train_loader = DataLoader(
-            GraphDataset(config, mode='train', max_samples=max_train_samples),
+            GraphDataset(config, mode='train', max_samples=max_train_samples, normalize=config['data']['normalize']),
             batch_size=config['data']['batch_size'], 
             shuffle=True, 
             drop_last=True,
             **kwargs)
 
-    val_dataset = GraphDataset(config, mode='val', max_samples=max_val_samples)
+    val_dataset = GraphDataset(config, mode='val', max_samples=max_val_samples,  normalize=config['data']['normalize'])
     batch_size = val_dataset.num_samples if val_dataset.__len__() < config['data']['batch_size'] else config['data']['batch_size']
     val_loader = DataLoader(
             val_dataset,
